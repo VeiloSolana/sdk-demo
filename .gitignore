@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+.env.local
+*.log
+.DS_Store
+
+# Proving keys — too large for git, copied in by the reader
+public/circuits/*.wasm
+public/circuits/*.zkey
