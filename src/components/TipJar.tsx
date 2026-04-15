@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { deposit } from "veilo-sdk-core";
 import { TOKENS, TokenId, toBaseUnits } from "../tokens";
-import { getProgram, loadTreeForMint, proofBuilder } from "../veilo";
+import { connection, getProgram, loadTreeForMint, proofBuilder } from "../veilo";
 
 interface DepositReceipt {
   txLabel: string;
@@ -23,8 +23,8 @@ export default function TipJar() {
   async function handleDeposit() {
     setError(null);
     setReceipt(null);
-    if (!wallet.publicKey) {
-      setError("Connect a wallet first.");
+    if (!wallet.publicKey || !wallet.signTransaction) {
+      setError("Connect a wallet that supports signing.");
       return;
     }
     setBusy(true);
@@ -35,11 +35,12 @@ export default function TipJar() {
       // Sync the local Merkle tree with chain state before proving.
       const tree = await loadTreeForMint(token.mint.toBase58());
 
-      // Deposit: builds the SNARK proof client-side, then submits the
-      // Anchor transaction that inserts the commitment on-chain.
-      const result = await deposit({
+      // Build the deposit transaction (proof + unsigned Solana tx). The SDK
+      // intentionally does not submit — we sign with wallet-adapter ourselves
+      // and only commit the new leaves to the local tree after confirmation.
+      const { transaction, commit } = await deposit({
         program,
-        depositor: wallet as any,
+        depositor: { publicKey: wallet.publicKey },
         amount: toBaseUnits(amount, token.decimals),
         mintAddress: token.mint,
         recipientPubkey: BigInt(recipient),
@@ -47,6 +48,11 @@ export default function TipJar() {
         proofBuilder,
       });
 
+      const signed = await wallet.signTransaction(transaction);
+      const sig = await connection.sendRawTransaction(signed.serialize());
+      await connection.confirmTransaction(sig, "confirmed");
+
+      const result = commit();
       setReceipt({
         txLabel: `${amount} ${token.label}`,
         commitment: bytesToHex(result.outputUTXOs[0].commitment),
@@ -65,14 +71,21 @@ export default function TipJar() {
     <div className="panel">
       <div className="row">
         <label>Token</label>
-        <select value={tokenId} onChange={(e) => setTokenId(e.target.value as TokenId)}>
+        <select
+          value={tokenId}
+          onChange={(e) => setTokenId(e.target.value as TokenId)}
+        >
           <option value="SOL">SOL</option>
           <option value="USDC">USDC</option>
         </select>
       </div>
       <div className="row">
         <label>Amount</label>
-        <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.1" />
+        <input
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+          placeholder="0.1"
+        />
       </div>
       <div className="row">
         <label>Recipient shielded pubkey</label>
@@ -82,17 +95,33 @@ export default function TipJar() {
           placeholder="Paste the tip-jar address from the Claim tab"
         />
       </div>
-      <button className="primary" onClick={handleDeposit} disabled={busy || !recipient}>
+      <button
+        className="primary"
+        onClick={handleDeposit}
+        disabled={busy || !recipient}
+      >
         {busy ? "Proving & depositing…" : "Send tip"}
       </button>
 
       {error && <div className="status err">{error}</div>}
       {receipt && (
         <div className="status">
-          <div className="kv"><span>Deposited</span><span>{receipt.txLabel}</span></div>
-          <div className="kv"><span>Leaf index</span><span className="mono">{receipt.leafIndex}</span></div>
-          <div className="kv"><span>Commitment</span><span className="mono">{shorten(receipt.commitment)}</span></div>
-          <div className="kv"><span>New root</span><span className="mono">{shorten(receipt.root)}</span></div>
+          <div className="kv">
+            <span>Deposited</span>
+            <span>{receipt.txLabel}</span>
+          </div>
+          <div className="kv">
+            <span>Leaf index</span>
+            <span className="mono">{receipt.leafIndex}</span>
+          </div>
+          <div className="kv">
+            <span>Commitment</span>
+            <span className="mono">{shorten(receipt.commitment)}</span>
+          </div>
+          <div className="kv">
+            <span>New root</span>
+            <span className="mono">{shorten(receipt.root)}</span>
+          </div>
         </div>
       )}
     </div>
@@ -100,7 +129,12 @@ export default function TipJar() {
 }
 
 function bytesToHex(b: Uint8Array): string {
-  return "0x" + Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+  return (
+    "0x" +
+    Array.from(b)
+      .map((x) => x.toString(16).padStart(2, "0"))
+      .join("")
+  );
 }
 function shorten(s: string): string {
   return s.length > 20 ? `${s.slice(0, 10)}…${s.slice(-8)}` : s;
