@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
-import { loadOrCreateKeypair, resetKeypair } from "../storage";
+import { loadStoredPublicKey, saveVeiloPublicKey, resetKeypair } from "../storage";
 import { authenticate } from "../auth";
 import { relayerClient } from "../veilo";
 import { TOKENS, TokenId, fromBaseUnits } from "../tokens";
@@ -10,7 +10,9 @@ interface ClaimReceipt { txSignature?: string; withdrew: string; change: string 
 
 export default function Claim() {
   const wallet = useWallet();
-  const [kp] = useState(() => loadOrCreateKeypair());
+  const [veiloPublicKey, setVeiloPublicKey] = useState<string | null>(
+    () => loadStoredPublicKey(),
+  );
   const [tokenId, setTokenId] = useState<TokenId>("SOL");
   const [noteCount, setNoteCount] = useState<number | null>(null);
   const [authed, setAuthed] = useState(false);
@@ -23,13 +25,15 @@ export default function Claim() {
     if (!wallet.publicKey || authed) return;
     (async () => {
       try {
-        await authenticate(wallet, kp.publicKey);
+        const { veiloPublicKey: vpk } = await authenticate(wallet);
+        saveVeiloPublicKey(vpk);
+        setVeiloPublicKey(vpk);
         setAuthed(true);
       } catch (e: any) {
         setError(`Auth failed: ${e.message ?? e}`);
       }
     })();
-  }, [wallet.publicKey, authed, wallet, kp.publicKey]);
+  }, [wallet.publicKey, authed, wallet]);
 
   // Once authenticated, pull the recipient's encrypted notes. In a real app
   // you would decrypt + filter them client-side with the shielded privkey;
@@ -51,7 +55,7 @@ export default function Claim() {
   async function handleClaim() {
     setError(null);
     setReceipt(null);
-    if (!wallet.publicKey) return;
+    if (!wallet.publicKey || !veiloPublicKey) return;
     setBusy(true);
     try {
       const token = TOKENS[tokenId];
@@ -71,7 +75,7 @@ export default function Claim() {
         notes: unspent.slice(0, 2).map((n) => JSON.parse(n.encryptedBlob)),
         recipient: wallet.publicKey.toBase58(),
         amount: "0", // 0 = withdraw full note value
-        userPublicKey: kp.publicKey.toString(),
+        userPublicKey: veiloPublicKey,
         mintAddress: token.mint.toBase58(),
       });
 
@@ -91,7 +95,7 @@ export default function Claim() {
 
   return (
     <div className="panel">
-      <AddressCard label="Your tip-jar address (share this)" address={kp.publicKey.toString()} />
+      <AddressCard label="Your tip-jar address (share this)" address={veiloPublicKey ?? "…"} />
 
       <div className="row">
         <label>Token to claim</label>

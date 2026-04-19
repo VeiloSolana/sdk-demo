@@ -34,6 +34,15 @@ export const relayerClient = new VeiloRelayerClient({
   relayerPublicKey: import.meta.env.VITE_VEILO_RELAYER_PUBKEY ?? "",
 });
 
+console.log(
+  "relayerUrl ",
+  import.meta.env.VITE_VEILO_RELAYER_URL,
+  " apiKey ",
+  import.meta.env.VITE_VEILO_API_KEY,
+  " relayerPublicKey ",
+  import.meta.env.VITE_VEILO_RELAYER_PUBKEY,
+);
+
 /**
  * Transaction proof builder. Uses the SDK's `formatInputsForSnarkjs` to
  * build the witness object, then hands it to snarkjs directly.

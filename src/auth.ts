@@ -1,46 +1,79 @@
 import type { WalletContextState } from "@solana/wallet-adapter-react";
-import bs58 from "bs58";
 import { relayerClient } from "./veilo";
 
+const RELAYER_URL = (
+  import.meta.env.VITE_VEILO_RELAYER_URL ?? "https://relayer-server.onrender.com"
+).replace(/\/+$/, "");
+
+const API_KEY = import.meta.env.VITE_VEILO_API_KEY ?? "";
+
+async function post(path: string, body: unknown): Promise<any> {
+  const res = await fetch(`${RELAYER_URL}/api${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
 /**
- * Sign the relayer's challenge with the connected wallet, then register or
- * restore. Returns a JWT that the relayer client uses to authorize
- * `queryEncryptedNotes` calls.
+ * Authenticate with the relayer. For existing accounts, issues a
+ * challenge-signature round-trip (restore). For new accounts, registers
+ * directly — the relayer generates and stores the veilo keypair.
  *
- * Tutorial note: we try `restore` first (existing account) and fall back to
- * `register` with an auto-generated username. A real app would prompt.
+ * Returns the JWT auth token and the user's veilo public key.
  */
 export async function authenticate(
   wallet: WalletContextState,
-  shieldedPublicKey: bigint,
-): Promise<string> {
+): Promise<{ token: string; veiloPublicKey: string }> {
   if (!wallet.publicKey || !wallet.signMessage) {
     throw new Error("Wallet missing signMessage capability");
   }
-  const walletPub = wallet.publicKey.toBase58();
+  const publicKey = wallet.publicKey.toBase58();
 
-  const { challenge } = await relayerClient.getChallenge(walletPub);
-  const sigBytes = await wallet.signMessage(new TextEncoder().encode(challenge));
-  const signature = bs58.encode(sigBytes);
+  // Try challenge-based restore for existing accounts.
+  const challengeData = await post("/auth/challenge", { publicKey });
+  if (challengeData.challenge) {
+    // Server extracts the challenge via: message.match(/Challenge: ([a-f0-9]+)/)
+    const message = `Challenge: ${challengeData.challenge}`;
 
-  try {
-    const res = await relayerClient.restore({
-      walletPublicKey: walletPub,
-      challenge,
+    const sigBytes = await wallet.signMessage(
+      new TextEncoder().encode(message),
+    );
+
+    // Server's verifySignature uses tweetnacl-util.decodeBase64 — must be base64.
+    const signature = btoa(String.fromCharCode(...sigBytes));
+
+    const restoreData = await post("/auth/restore", {
+      publicKey,
       signature,
+      message,
     });
-    relayerClient.setAuthToken(res.token);
-    return res.token;
-  } catch {
-    // New wallet — register a fresh account.
-    const res = await relayerClient.register({
-      username: `tutorial-${walletPub.slice(0, 6)}`,
-      walletPublicKey: walletPub,
-      challenge,
-      signature,
-      veiloPublicKey: shieldedPublicKey.toString(),
-    });
-    relayerClient.setAuthToken(res.token);
-    return res.token;
+    if (!restoreData.token) {
+      throw new Error(restoreData.error || "Restore failed");
+    }
+    relayerClient.setAuthToken(restoreData.token);
+    return {
+      token: restoreData.token,
+      veiloPublicKey: restoreData.veiloPublicKey,
+    };
   }
+
+  // No account found — register a fresh one. The relayer generates the
+  // veilo keypair and returns the public key for tip-jar addressing.
+  const regData = await post("/auth/register", {
+    username: `tutorial-${publicKey.slice(0, 6)}`,
+    publicKey,
+  });
+  if (!regData.token) {
+    throw new Error(regData.error || "Registration failed");
+  }
+  relayerClient.setAuthToken(regData.token);
+  return {
+    token: regData.token,
+    veiloPublicKey: regData.veiloPublicKey,
+  };
 }
