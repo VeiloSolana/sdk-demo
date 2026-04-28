@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
-import { loadStoredPublicKey, saveVeiloPublicKey, resetKeypair } from "../storage";
+import { loadStoredPrivateKey, resetKeypair } from "../storage";
 import { authenticate } from "../auth";
-import { relayerClient } from "../veilo";
+import { relayerClient, ensureVeiloKeypair, bigIntToBytesBE, getVeiloNaclPublicKey, decryptNoteBlob } from "../veilo";
 import { TOKENS, TokenId, fromBaseUnits } from "../tokens";
 import AddressCard from "./AddressCard";
 
@@ -10,9 +10,9 @@ interface ClaimReceipt { txSignature?: string; withdrew: string; change: string 
 
 export default function Claim() {
   const wallet = useWallet();
-  const [veiloPublicKey, setVeiloPublicKey] = useState<string | null>(
-    () => loadStoredPublicKey(),
-  );
+  const [veiloPublicKey, setVeiloPublicKey] = useState<string | null>(null);
+  const [veiloPrivateKey, setVeiloPrivateKey] = useState<string | null>(null);
+  const [tipJarAddress, setTipJarAddress] = useState<string | null>(null);
   const [tokenId, setTokenId] = useState<TokenId>("SOL");
   const [noteCount, setNoteCount] = useState<number | null>(null);
   const [authed, setAuthed] = useState(false);
@@ -20,14 +20,18 @@ export default function Claim() {
   const [error, setError] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<ClaimReceipt | null>(null);
 
-  // Authenticate with the relayer the moment a wallet is connected.
+  // Generate (or load) the local veilo keypair and authenticate with the
+  // relayer the moment a wallet is connected.
   useEffect(() => {
     if (!wallet.publicKey || authed) return;
     (async () => {
       try {
-        const { veiloPublicKey: vpk } = await authenticate(wallet);
-        saveVeiloPublicKey(vpk);
-        setVeiloPublicKey(vpk);
+        const kp = await ensureVeiloKeypair();
+        setVeiloPublicKey(kp.publicKey);
+        setVeiloPrivateKey(kp.privateKey);
+        const naclPubKey = getVeiloNaclPublicKey(BigInt(kp.privateKey));
+        setTipJarAddress(`${kp.publicKey}|${naclPubKey}|${wallet.publicKey!.toBase58()}`);
+        await authenticate(wallet);
         setAuthed(true);
       } catch (e: any) {
         setError(`Auth failed: ${e.message ?? e}`);
@@ -35,22 +39,29 @@ export default function Claim() {
     })();
   }, [wallet.publicKey, authed, wallet]);
 
-  // Once authenticated, pull the recipient's encrypted notes. In a real app
-  // you would decrypt + filter them client-side with the shielded privkey;
-  // for the tutorial we just surface the count as a "balance" proxy.
+  // Once authenticated, count encrypted notes addressed to this tip-jar key.
   useEffect(() => {
-    if (!authed) return;
+    if (!authed || !veiloPublicKey) return;
     (async () => {
       try {
         const res = await relayerClient.queryEncryptedNotes({
           walletPublicKey: wallet.publicKey?.toBase58(),
         });
-        setNoteCount(res.notes.filter((n) => !n.spent).length);
+        const myUnspent = res.notes.filter((n) => {
+          if (n.spent || !veiloPrivateKey) return false;
+          try {
+            const blob = decryptNoteBlob(n.ephemeralPublicKey, n.encryptedBlob, BigInt(veiloPrivateKey)) as any;
+            return blob.recipientVeiloPublicKey === veiloPublicKey;
+          } catch {
+            return false;
+          }
+        });
+        setNoteCount(myUnspent.length);
       } catch (e: any) {
         setError(`Query failed: ${e.message ?? e}`);
       }
     })();
-  }, [authed, wallet.publicKey]);
+  }, [authed, veiloPublicKey, wallet.publicKey]);
 
   async function handleClaim() {
     setError(null);
@@ -59,23 +70,53 @@ export default function Claim() {
     setBusy(true);
     try {
       const token = TOKENS[tokenId];
-      const notes = await relayerClient.queryEncryptedNotes({
+      const myVpk = veiloPublicKey;
+
+      const notesRes = await relayerClient.queryEncryptedNotes({
         walletPublicKey: wallet.publicKey.toBase58(),
       });
-      const unspent = notes.notes.filter((n) => !n.spent);
-      if (unspent.length === 0) throw new Error("No unspent notes for this wallet");
 
-      // The relayer does the proving server-side. Client only supplies the
-      // note secrets encrypted under the relayer's NaCl public key — see
-      // VeiloRelayerClient.submitWithdraw in the SDK.
+      // Filter to notes deposited for our tip-jar address and decrypt blobs.
+      const storedPrivKey = loadStoredPrivateKey()!;
+      const privKeyBigInt = BigInt(storedPrivKey);
+      const privKeyBytes = bigIntToBytesBE(privKeyBigInt);
+      const privateKeyHex = Array.from(privKeyBytes)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      type DecryptedBlob = { commitment: string; blinding: string; amount: string; leafIndex: number; recipientVeiloPublicKey: string };
+      const unspent: Array<{ note: typeof notesRes.notes[0]; blob: DecryptedBlob }> = [];
+      for (const n of notesRes.notes) {
+        if (n.spent) continue;
+        try {
+          const blob = decryptNoteBlob(n.ephemeralPublicKey, n.encryptedBlob, privKeyBigInt) as DecryptedBlob;
+          if (blob.recipientVeiloPublicKey === myVpk) unspent.push({ note: n, blob });
+        } catch {
+          // Note not for us or old format — skip.
+        }
+      }
+      if (unspent.length === 0)
+        throw new Error("No unspent notes for this tip-jar address");
+
+      // Build the TransactNote array the relayer expects. The nullifier field
+      // is required by the type but the relayer recomputes it from
+      // (commitment, leafIndex, privateKey) — a dummy value is safe here.
+      const transactNotes = unspent.slice(0, 2).map(({ note, blob }) => ({
+        commitment: blob.commitment,
+        privateKey: privateKeyHex,
+        publicKey: myVpk,
+        blinding: blob.blinding,
+        amount: blob.amount,
+        nullifier: "00".repeat(32),
+        leafIndex: blob.leafIndex,
+        noteId: note.noteId,
+      }));
+
       const res = await relayerClient.submitWithdraw({
-        // NOTE: the tutorial hands over the commitment + nullifier material
-        // straight from the decrypted blobs. In production you would decrypt
-        // with the shielded privkey here before sending.
-        notes: unspent.slice(0, 2).map((n) => JSON.parse(n.encryptedBlob)),
+        notes: transactNotes,
         recipient: wallet.publicKey.toBase58(),
         amount: "0", // 0 = withdraw full note value
-        userPublicKey: veiloPublicKey,
+        userPublicKey: myVpk,
         mintAddress: token.mint.toBase58(),
       });
 
@@ -95,7 +136,7 @@ export default function Claim() {
 
   return (
     <div className="panel">
-      <AddressCard label="Your tip-jar address (share this)" address={veiloPublicKey ?? "…"} />
+      <AddressCard label="Your tip-jar address (share this)" address={tipJarAddress ?? "…"} />
 
       <div className="row">
         <label>Token to claim</label>

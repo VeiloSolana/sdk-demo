@@ -1,5 +1,5 @@
 import type { WalletContextState } from "@solana/wallet-adapter-react";
-import { relayerClient } from "./veilo";
+import { relayerClient, ensureVeiloKeypair } from "./veilo";
 
 const RELAYER_URL = (
   import.meta.env.VITE_VEILO_RELAYER_URL ?? "https://relayer-server.onrender.com"
@@ -56,14 +56,16 @@ export async function authenticate(
       throw new Error(restoreData.error || "Restore failed");
     }
     relayerClient.setAuthToken(restoreData.token);
+    const { publicKey: vkLocal } = await ensureVeiloKeypair();
     return {
       token: restoreData.token,
-      veiloPublicKey: restoreData.veiloPublicKey,
+      veiloPublicKey: vkLocal,
     };
   }
 
-  // No account found — register a fresh one. The relayer generates the
-  // veilo keypair and returns the public key for tip-jar addressing.
+  // No account found — register a fresh one. The relayer generates and stores
+  // a server-side keypair, but we use our locally-generated one instead so
+  // the private key never leaves the browser.
   const regData = await post("/auth/register", {
     username: `tutorial-${publicKey.slice(0, 6)}`,
     publicKey,
@@ -72,8 +74,9 @@ export async function authenticate(
     throw new Error(regData.error || "Registration failed");
   }
   relayerClient.setAuthToken(regData.token);
+  const { publicKey: vkLocal } = await ensureVeiloKeypair();
   return {
     token: regData.token,
-    veiloPublicKey: regData.veiloPublicKey,
+    veiloPublicKey: vkLocal,
   };
 }

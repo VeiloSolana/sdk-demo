@@ -1,26 +1,32 @@
 const KEY = "veilo-tutorial:shielded-keypair";
 
-/**
- * Load the veilo public key persisted from a previous registration.
- * Returns null if the user has never registered (or has reset).
- */
-export function loadStoredPublicKey(): string | null {
+interface StoredKeypair {
+  privateKey: string; // BigInt decimal string
+  publicKey: string;  // BigInt decimal string
+}
+
+export function loadStoredKeypair(): StoredKeypair | null {
   const raw = localStorage.getItem(KEY);
   if (!raw) return null;
   try {
-    const stored = JSON.parse(raw) as { veiloPublicKey?: string };
-    return stored.veiloPublicKey ?? null;
+    const stored = JSON.parse(raw) as Partial<StoredKeypair>;
+    if (stored.privateKey && stored.publicKey) return stored as StoredKeypair;
+    return null;
   } catch {
     return null;
   }
 }
 
-/**
- * Persist the relayer-assigned veilo public key so the tip-jar address
- * survives page reloads.
- */
-export function saveVeiloPublicKey(veiloPublicKey: string): void {
-  localStorage.setItem(KEY, JSON.stringify({ veiloPublicKey }));
+export function loadStoredPublicKey(): string | null {
+  return loadStoredKeypair()?.publicKey ?? null;
+}
+
+export function loadStoredPrivateKey(): string | null {
+  return loadStoredKeypair()?.privateKey ?? null;
+}
+
+export function saveKeypair(keypair: StoredKeypair): void {
+  localStorage.setItem(KEY, JSON.stringify(keypair));
 }
 
 export function resetKeypair(): void {
