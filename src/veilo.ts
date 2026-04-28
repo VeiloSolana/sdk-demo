@@ -86,7 +86,16 @@ export async function ensureVeiloKeypair(): Promise<{
 }> {
   await veiloReady;
   const existing = loadStoredKeypair();
-  if (existing) return existing;
+  if (existing) {
+    // Always recompute publicKey from privateKey — guards against stale stored
+    // values from sessions where Poseidon wasn't fully initialised yet.
+    const recomputed = (derivePublicKey as (pk: bigint) => bigint)(BigInt(existing.privateKey));
+    const keypair = { privateKey: existing.privateKey, publicKey: recomputed.toString() };
+    if (keypair.publicKey !== existing.publicKey) {
+      saveKeypair(keypair);
+    }
+    return keypair;
+  }
   const kp = (generateKeypair as () => { privateKey: bigint; publicKey: bigint })();
   const keypair = {
     privateKey: kp.privateKey.toString(),
